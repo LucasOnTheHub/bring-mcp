@@ -187,6 +187,7 @@ async function handleOAuthRequest(
         issuer: baseUrl,
         authorization_endpoint: `${baseUrl}/authorize`,
         token_endpoint: `${baseUrl}/token`,
+        registration_endpoint: `${baseUrl}/register`,
         response_types_supported: ['code'],
         grant_types_supported: ['authorization_code'],
         code_challenge_methods_supported: ['S256'],
@@ -269,6 +270,24 @@ async function handleOAuthRequest(
       res.end();
       return true;
     }
+  }
+
+  // Dynamic Client Registration (RFC 7591) — required by MCP spec
+  if (pathname === '/register' && req.method === 'POST') {
+    const body = (await readRequestBody(req)) as Record<string, unknown> | undefined;
+    const clientId = crypto.randomUUID();
+    res.writeHead(201, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+    res.end(
+      JSON.stringify({
+        client_id: clientId,
+        client_name: (body?.client_name as string) ?? 'MCP Client',
+        redirect_uris: (body?.redirect_uris as string[]) ?? [],
+        grant_types: ['authorization_code'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
+      }),
+    );
+    return true;
   }
 
   // Token endpoint — exchange authorization code for access token
@@ -378,7 +397,9 @@ async function main() {
     // Authenticate when MCP_API_KEY is configured
     if (!isAuthenticated(req, API_KEY)) {
       const baseUrl = getServerBaseUrl(req);
-      res.writeHead(401, { 'WWW-Authenticate': `Bearer resource="${baseUrl}/mcp"` });
+      res.writeHead(401, {
+        'WWW-Authenticate': `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"`,
+      });
       res.end('Unauthorized');
       return;
     }
