@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import http, { IncomingMessage, ServerResponse } from 'node:http';
 import { z, ZodRawShape, ZodObject } from 'zod';
 import { BringClient } from './bringClient.js';
 import 'dotenv/config';
@@ -15,8 +16,6 @@ const server = new McpServer({
   name: 'bring',
   version: '1.0.0',
 });
-
-// const bc = new BringClient(); // Moved into main
 
 // Define a type for content parts
 type McpContentPart = { type: 'text'; text: string; [key: string]: unknown };
@@ -91,7 +90,42 @@ export function registerTool(options: {
   }
 }
 
-// Register login tool and other tools moved into main
+async function readRequestBody(req: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        const body = Buffer.concat(chunks).toString('utf-8');
+        resolve(body ? JSON.parse(body) : undefined);
+      } catch {
+        reject(new Error('Invalid JSON in request body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function setCorsHeaders(res: ServerResponse, origin: string | undefined, allowedOrigin: string): void {
+  // Reflect the request Origin only when CORS_ORIGIN is a specific domain, otherwise use wildcard
+  const effectiveOrigin = allowedOrigin === '*' ? '*' : (origin ?? '*');
+  res.setHeader('Access-Control-Allow-Origin', effectiveOrigin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Accept, Authorization, x-api-key, Mcp-Session-Id, Last-Event-ID',
+  );
+  res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
+  res.setHeader('Access-Control-Max-Age', '86400');
+}
+
+function isAuthenticated(req: IncomingMessage, apiKey: string | undefined): boolean {
+  if (!apiKey) return true; // No MCP_API_KEY set: open access
+  const auth = req.headers['authorization'];
+  if (auth?.startsWith('Bearer ') && auth.slice(7) === apiKey) return true;
+  if (req.headers['x-api-key'] === apiKey) return true;
+  return false;
+}
 
 // Start the server
 async function main() {
@@ -111,9 +145,67 @@ async function main() {
   registerUserTools(server, bc);
   registerCatalogTools(server, bc);
 
-  const transport = new StdioServerTransport();
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: undefined, // stateless mode: no session management
+  });
   await server.connect(transport);
-  console.error('MCP server for Bring! API is running on STDIO');
+
+  const PORT = parseInt(process.env.PORT ?? '3000', 10);
+  const API_KEY = process.env.MCP_API_KEY; // Optional bearer token / API key
+  const ALLOWED_ORIGIN = process.env.CORS_ORIGIN ?? '*'; // e.g. "https://claude.ai"
+
+  const httpServer = http.createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    const origin = req.headers['origin'] as string | undefined;
+    setCorsHeaders(res, origin, ALLOWED_ORIGIN);
+
+    // Handle CORS preflight
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    // Health check endpoint used by Railway and other platforms
+    const pathname = req.url?.split('?')[0];
+    if (pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok' }));
+      return;
+    }
+
+    // Only serve MCP traffic at /mcp
+    if (pathname !== '/mcp') {
+      res.writeHead(404);
+      res.end('Not Found');
+      return;
+    }
+
+    // Authenticate when MCP_API_KEY is configured
+    if (!isAuthenticated(req, API_KEY)) {
+      res.writeHead(401, { 'WWW-Authenticate': 'Bearer' });
+      res.end('Unauthorized');
+      return;
+    }
+
+    try {
+      if (req.method === 'POST') {
+        const body = await readRequestBody(req);
+        await transport.handleRequest(req, res, body);
+      } else {
+        // GET (SSE streaming) and DELETE (session close)
+        await transport.handleRequest(req, res);
+      }
+    } catch (err) {
+      console.error('Request handling error:', err);
+      if (!res.headersSent) {
+        res.writeHead(500);
+        res.end('Internal Server Error');
+      }
+    }
+  });
+
+  console.error(`MCP server for Bring! API is running on HTTP port ${PORT}`);
+  httpServer.listen(PORT);
 }
 
 main().catch((e) => {
