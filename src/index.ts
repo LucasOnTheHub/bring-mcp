@@ -108,16 +108,21 @@ async function readRequestBody(req: IncomingMessage): Promise<unknown> {
 }
 
 function setCorsHeaders(res: ServerResponse, origin: string | undefined, allowedOrigin: string): void {
-  // Reflect the request Origin only when CORS_ORIGIN is a specific domain, otherwise use wildcard
-  const effectiveOrigin = allowedOrigin === '*' ? '*' : (origin ?? '*');
+  // Always reflect the actual request Origin (required for credentialed requests with Authorization header).
+  // Wildcard '*' is NOT allowed by browsers when credentials are used, so we reflect instead.
+  const effectiveOrigin = allowedOrigin === '*' ? (origin ?? '*') : (origin ?? allowedOrigin);
   res.setHeader('Access-Control-Allow-Origin', effectiveOrigin);
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
-    'Content-Type, Accept, Authorization, x-api-key, Mcp-Session-Id, Last-Event-ID',
+    'Content-Type, Accept, Authorization, x-api-key, Mcp-Session-Id, Last-Event-ID, MCP-Protocol-Version',
   );
   res.setHeader('Access-Control-Expose-Headers', 'Mcp-Session-Id');
   res.setHeader('Access-Control-Max-Age', '86400');
+  if (effectiveOrigin !== '*') {
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
 }
 
 function isAuthenticated(req: IncomingMessage, apiKey: string | undefined): boolean {
@@ -329,7 +334,7 @@ async function handleOAuthRequest(
 
     pendingCodes.delete(code);
     res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify({ access_token: apiKey, token_type: 'bearer' }));
+    res.end(JSON.stringify({ access_token: apiKey, token_type: 'bearer', scope: 'mcp' }));
     return true;
   }
 
@@ -389,8 +394,8 @@ async function main() {
 
     // Only serve MCP traffic at /mcp
     if (pathname !== '/mcp') {
-      res.writeHead(404);
-      res.end('Not Found');
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not_found' }));
       return;
     }
 
@@ -398,9 +403,10 @@ async function main() {
     if (!isAuthenticated(req, API_KEY)) {
       const baseUrl = getServerBaseUrl(req);
       res.writeHead(401, {
+        'Content-Type': 'application/json',
         'WWW-Authenticate': `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"`,
       });
-      res.end('Unauthorized');
+      res.end(JSON.stringify({ error: 'unauthorized', error_description: 'Bearer token required' }));
       return;
     }
 
